@@ -36,15 +36,16 @@ import 'package:window_manager/window_manager.dart';
 import 'package:path/path.dart' as p;
 import 'package:dynamic_color/dynamic_color.dart';
 
+RandomAccessFile? _desktopInstanceLock;
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await migrateData();
   await initWindow();
   MediaKit.ensureInitialized();
+  final hiveHome = await resolveDesktopHiveHome();
   await Hive.initFlutter(
-    (!Platform.isAndroid && !Platform.isIOS)
-        ? (await getApplicationSupportDirectory()).path
-        : null,
+    (!Platform.isAndroid && !Platform.isIOS) ? hiveHome : null,
   );
   //初始化服务
   await initServices();
@@ -57,6 +58,77 @@ void main() async {
   );
   SystemChrome.setSystemUIOverlayStyle(systemUiOverlayStyle);
   runApp(const MyApp());
+}
+
+Future<String?> resolveDesktopHiveHome() async {
+  if (Platform.isAndroid || Platform.isIOS) {
+    return null;
+  }
+
+  final supportDir = await getApplicationSupportDirectory();
+  final rootPath = supportDir.path;
+  final rootDir = Directory(rootPath);
+  if (!await rootDir.exists()) {
+    await rootDir.create(recursive: true);
+  }
+
+  final lockFile = File(p.join(rootPath, '.simple_live_multi_instance.lock'));
+
+  try {
+    _desktopInstanceLock = lockFile.openSync(mode: FileMode.writeOnlyAppend);
+    _desktopInstanceLock!.lockSync(FileLock.exclusive);
+    await cleanupTempHiveDirs(Directory(p.join(rootPath, 'multi_instance')));
+    return rootPath;
+  } on FileSystemException {
+    final instancePath = p.join(rootPath, 'multi_instance', 'instance_$pid');
+    final instanceDir = Directory(instancePath);
+    if (!await instanceDir.exists()) {
+      await instanceDir.create(recursive: true);
+    }
+
+    await copyHiveBoxes(source: rootDir, target: instanceDir);
+    return instancePath;
+  }
+}
+
+Future<void> copyHiveBoxes({
+  required Directory source,
+  required Directory target,
+}) async {
+  if (!await source.exists()) {
+    return;
+  }
+
+  await for (final entity in source.list(followLinks: false)) {
+    if (entity is! File || p.extension(entity.path) != '.hive') {
+      continue;
+    }
+
+    final targetPath = p.join(target.path, p.basename(entity.path));
+    final targetFile = File(targetPath);
+    if (await targetFile.exists()) {
+      await targetFile.delete();
+    }
+    await entity.copy(targetPath);
+  }
+}
+
+Future<void> cleanupTempHiveDirs(Directory root) async {
+  if (!await root.exists()) {
+    return;
+  }
+
+  await for (final entity in root.list(followLinks: false)) {
+    if (entity is! Directory) {
+      continue;
+    }
+
+    try {
+      await entity.delete(recursive: true);
+    } catch (_) {
+      // 忽略清理失败，避免影响应用启动。
+    }
+  }
 }
 
 /// 将Hive数据迁移到Application Support
